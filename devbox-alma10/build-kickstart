@@ -1,75 +1,315 @@
 #!/usr/bin/env bash
 #
-# Renders templated alma-devbox.ks.cfg based on optional args:
-#
-# --tools-dir
-#
-# Iterates tools.d/*.sh in sorted order, and generates install scripts in the
-# guest. Adding a new tool later just means dropping a new numbered .sh file in
-# tools.d/ and rerunning create-vm.
-#
-# --host-scripts-manifest
-#
-# Reads a manifest of host-side script paths and copies each script to the guest
-# at /usr/local/bin to serve as callable utilities after the install completes.
-#
-# --bashrc-local
-#
-# Places the given host file as ~/.bashrc.local in the guest and appends an
-# idempotent sourcing line to ~/.bashrc, since Alma's default .bashrc doesn't
-# source .bashrc.local on its own the way some other distros do.
+# Renders alma-devbox.ks.cfg into a final kickstart file, invoked by create-vm.
+# Splices three optional, independent pieces of content into template markers:
+# tool installers (tools.d/*.sh), host-provided utility scripts, and a
+# .bashrc.local fragment. Each is spliced in via sed's r (read file) + d
+# (delete matched line) idiom -- this dumps a file's raw bytes into the output
+# stream rather than passing them through a s/// substitution, so nothing in
+# the spliced content (slashes, quotes, whatever) needs escaping.
 #
 set -e
 
-long_opts=template:,tools-dir:,password-hash:,host-scripts-manifest:,bashrc-local:,out:
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# Short and long option definitions
+#
+short_opts=t:,d:,p:,s:,b:,o:,h
+long_opts=template:,tools-dir:,password-hash:,host-scripts-manifest:,\
+bashrc-local:,out:,help
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_name=$(basename "$0")
+
+# vars initialized by cmdline
+
+#
+# -t|--template
+#
+# Path to the kickstart template containing the REPLACE-WITH-* markers.
+# Required.
+#
 template=
+
+#
+# -d|--tools-dir
+#
+# Path on the host to a directory of tools.d/*.sh scripts. Each gets
+# embedded and run in the guest as a %post step. Optional -- when omitted,
+# the dev-tools %post section is a no-op.
+#
 tools_dir=
+
+#
+# -p|--password-hash
+#
+# Pre-hashed (openssl passwd -6) password for the guest's dev account.
+# Required.
+#
 password_hash=
+
+#
+# -s|--host-scripts-manifest
+#
+# Path on the host to a file listing script paths (one per line, '#'
+# comments and blank lines ignored). Each listed script is copied into the
+# guest at /usr/local/bin as a callable utility. Optional.
+#
 host_scripts_manifest=
+
+#
+# -b|--bashrc-local
+#
+# Path on the host to a file placed as ~/.bashrc.local in the guest, wired
+# into ~/.bashrc via an idempotent sourcing line. Optional.
+#
 bashrc_local=
+
+#
+# -o|--out
+#
+# Path to write the final, rendered kickstart file to. Required.
+#
 out=
 
-if ! parsed=$($script_dir/../shared/parseargs $long_opts "$@"); then
-  echo "$parsed"
-  exit 1
-fi
+# vars initialized by script
 
-# printf -v avoids eval side-effects (e.g. embedded '$' in arg values)
+tools_concat=
+extras_concat=
 
-while IFS='=' read -r name value; do
-  [[ -z "$name" ]] && continue
-  printf -v "$name" '%s' "$value"
-done < <(echo -e "$parsed")
+function usage() {
+  awk '{if (NR!=1) print substr($0,5)}' <<< '
+    Renders a kickstart template into a final kickstart file by splicing in
+    tool installers, host utility scripts, and .bashrc.local content.
+    Invoked by create-vm; not typically run directly.
 
-for arg in template password_hash out; do
-  if [[ -z "${!arg}" ]]; then
-    echo "--${arg//_/-} is required"
+    Usage: build-kickstart [-h,--help] [-t,--template path]
+           [-p,--password-hash hash] [-o,--out path] [-d,--tools-dir path]
+           [-s,--host-scripts-manifest path] [-b,--bashrc-local path]
+
+    Options:
+
+      -t,--template               Path to the kickstart template
+      -p,--password-hash          Pre-hashed dev-account password
+      -o,--out                    Path to write the rendered kickstart to
+      -d,--tools-dir              Path to tools.d (optional)
+      -s,--host-scripts-manifest  Path to a host-scripts manifest (optional)
+      -b,--bashrc-local           Path to a .bashrc.local fragment (optional)
+      -h,--help                   Prints this help and exits
+
+    Positional params:
+
+      None.
+
+    Examples:
+
+      ./build-kickstart\
+        --template ./alma-devbox.ks.cfg\
+        --password-hash "$(openssl passwd -6 frobozz)"\
+        --tools-dir ./tools.d\
+        --host-scripts-manifest ./devbox-utils.manifest\
+        --bashrc-local ./devbox-bashrc-local\
+        --out /tmp/ks.cfg
+    '
+}
+
+#
+# Helps interpret values parsed by getopt
+#
+# Params:
+#
+#   $1 is an option parameter parsed by getopt
+#
+# Returns:
+#
+#   If $1 starts with the equals sign, then returns everything after the equals
+#   sign. Otherwise returns $1 unmodified. Because if the user specifies a short
+#   option with the equal sign, (e.g. '-l=100') getopt includes the equal in the
+#   parsed option value. Technically the user shouldn't do that, but if they do
+#   we want to handle that. If the user specifies an option in any of the
+#   following forms, the parsed value will be correct:
+#     -l100
+#     -l 100
+#     -l=100
+#     --level=100
+#     --level 100
+#   (By the way, 'getopt' will parse -l100 and pick out the value 100, but will
+#   not parse --level100)
+#
+function opt_val() {
+  opt="$1"
+  if [[ "$opt" == =* ]]; then
+    echo "${opt:1}"
+  else
+    echo "$opt"
+  fi
+}
+
+#
+# Parses the command line, sets script variables, and validates them.
+#
+# Params:
+#
+#   $@ - The entire command line
+#
+# Returns:
+#
+#   Nothing
+#
+# Exits:
+#
+#   If parse error, or if required args are missing, or if a given path
+#   doesn't exist
+#
+# Sets script variables:
+#
+#   template               -- from '-t|--template'
+#   tools_dir               -- from '-d|--tools-dir'
+#   password_hash           -- from '-p|--password-hash'
+#   host_scripts_manifest    -- from '-s|--host-scripts-manifest'
+#   bashrc_local             -- from '-b|--bashrc-local'
+#   out                      -- from '-o|--out'
+#
+function parse_args() {
+  # must separate the local declaration from the assignment or the exit code is lost
+  local parsed
+  parsed=$(getopt --options $short_opts --longoptions $long_opts -n $script_name -- "$@")
+
+  if [[ "$?" -ne 0 ]]; then
     exit 1
   fi
-done
 
-tools_concat=$(mktemp)
-trap 'rm -f "$tools_concat"' EXIT
+  eval set -- "$parsed"
 
-found_any=0
-if [[ -n "$tools_dir" ]]; then
-  if [[ ! -d "$tools_dir" ]]; then
-    echo "--tools-dir is not a directory: $tools_dir" >&2
+  while true; do
+    case "$1" in
+      -t|--template)
+        template=$(opt_val "$2")
+        shift 2
+        ;;
+      -d|--tools-dir)
+        tools_dir=$(opt_val "$2")
+        shift 2
+        ;;
+      -p|--password-hash)
+        password_hash=$(opt_val "$2")
+        shift 2
+        ;;
+      -s|--host-scripts-manifest)
+        host_scripts_manifest=$(opt_val "$2")
+        shift 2
+        ;;
+      -b|--bashrc-local)
+        bashrc_local=$(opt_val "$2")
+        shift 2
+        ;;
+      -o|--out)
+        out=$(opt_val "$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 1
+        ;;
+      --)
+        shift
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -ne 0 ]]; then
+    echo "$script_name: Positional param(s) not supported"
     exit 1
   fi
+
+  for arg in template password_hash out; do
+    if [[ -z "${!arg}" ]]; then
+      echo "--${arg//_/-} is required"
+      exit 1
+    fi
+  done
+
+  for dir in tools_dir; do
+    if [[ -n "${!dir}" ]]; then
+      if [[ ! -d "${!dir}" ]]; then
+        echo "directory does not exist or is not a directory: ${!dir}"
+        exit 1
+      fi
+    fi
+  done
+
+  for file in template host_scripts_manifest bashrc_local; do
+    if [[ -n "${!file}" ]]; then
+      if [[ ! -f "${!file}" ]]; then
+        echo "file does not exist or is not a file: ${!file}"
+        exit 1
+      fi
+    fi
+  done
+}
+
+#
+# Creates the two scratch files content gets assembled into before being
+# spliced into the template, and arranges for their cleanup on exit.
+#
+# Sets script-level vars: 'tools_concat', 'extras_concat'
+#
+function init_tempfiles() {
+  tools_concat=$(mktemp)
+  extras_concat=$(mktemp)
+  trap cleanup_tempfiles EXIT
+}
+
+#
+# Scratch-file cleanup function. Guards against accidentally deleting
+# everything if the vars are empty or unbound.
+#
+# Refs script-level vars: 'tools_concat', 'extras_concat'
+#
+function cleanup_tempfiles() {
+  [[ -n "${tools_concat:-}" ]] && rm -f "$tools_concat"
+  [[ -n "${extras_concat:-}" ]] && rm -f "$extras_concat"
+}
+
+#
+# Builds the dev-tools %post content into 'tools_concat': each tools.d/*.sh
+# script is wrapped in its own heredoc that writes it to a persistent file
+# at /usr/local/sbin/devbox-tools.d/<name>.sh in the guest, followed by a
+# runner that executes them from there, in order, logging to
+# /var/log/devbox-tools-install.log. Keeping them as real files (rather than
+# inlining and running them directly) means a failing tool can be inspected,
+# edited, and re-run by hand inside the VM without a full rebuild; a fix
+# found that way then gets ported back into tools.d/ on the host. One tool
+# failing also doesn't skip the rest, since each runs as its own bash
+# subprocess rather than sharing one inlined script's set -e.
+#
+# When 'tools_dir' isn't given, this is a no-op comment instead.
+#
+# Refs script-level vars: 'tools_dir', 'tools_concat'
+#
+function build_tools_section() {
+  local found_any=0
+
+  if [[ -z "$tools_dir" ]]; then
+    echo "# --tools-dir not given; dev tool install skipped" >> "$tools_concat"
+    return
+  fi
+
   echo "mkdir -p /usr/local/sbin/devbox-tools.d" >> "$tools_concat"
   echo "" >> "$tools_concat"
 
   while IFS= read -r -d '' script; do
     found_any=1
+    local name
     name=$(basename "$script")
     echo "embedding $name" >&2
     # unique per-file delimiter avoids any collision even if a script body
-    # happened to contain a line matching a shared delimiter. Ensure file
-    # has a trailing newline otherwise the terminating heredoc delimiter
-    # will be on the same line as the last content line.
+    # happened to contain a line matching a shared delimiter. The extra
+    # echo "" guarantees a trailing newline before the delimiter even if
+    # the source file itself doesn't end in one -- otherwise the delimiter
+    # would land on the same line as the last content line and the heredoc
+    # would never terminate correctly.
+    local delim
     delim="TOOL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
     {
       echo "cat <<'$delim' > /usr/local/sbin/devbox-tools.d/$name"
@@ -104,76 +344,114 @@ if [[ "$failed" -eq 1 ]]; then
   echo "one or more dev tool installs failed -- see $log" >&2
 fi
 RUNNER_EOF
-else
-  echo "# --tools-dir not given; dev tool install skipped" >> "$tools_concat"
-fi
+}
 
-sed -e "/REPLACE-WITH-DEVTOOLS-POST/{r $tools_concat" -e 'd}' "$template" > "$out.tmp1"
+#
+# Builds the host-scripts + bashrc-local %post content into 'extras_concat'.
+# The two pieces are independent of each other; either, both, or neither
+# may be present depending on whether 'host_scripts_manifest'/'bashrc_local'
+# were given. When neither is given, this is a no-op comment instead.
+#
+# Refs script-level vars: 'host_scripts_manifest', 'bashrc_local',
+# 'extras_concat'
+#
+function build_extras_section() {
+  local extras_any=0
 
-# host utility scripts + bashrc (all optional, independent of each other)
-
-extras_concat=$(mktemp)
-trap 'rm -f "$tools_concat" "$extras_concat"' EXIT
-extras_any=0
-
-if [[ -n "$host_scripts_manifest" ]]; then
-  if [[ ! -f "$host_scripts_manifest" ]]; then
-    echo "--host-scripts-manifest file not found: $host_scripts_manifest" >&2
-    exit 1
+  if [[ -n "$host_scripts_manifest" ]]; then
+    echo "mkdir -p /usr/local/bin" >> "$extras_concat"
+    while IFS= read -r host_path || [[ -n "$host_path" ]]; do
+      # skip blank lines and '#' comments
+      [[ -z "$host_path" || "$host_path" =~ ^[[:space:]]*# ]] && continue
+      if [[ ! -f "$host_path" ]]; then
+        echo "host script not found, skipping: $host_path" >&2
+        continue
+      fi
+      extras_any=1
+      local name
+      name=$(basename "$host_path")
+      echo "embedding host script $name" >&2
+      # see build_tools_section for why the delimiter is unique per file and
+      # why a trailing newline is forced before it
+      local delim
+      delim="UTIL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
+      {
+        echo "cat <<'$delim' > /usr/local/bin/$name"
+        cat "$host_path"
+        echo ""
+        echo "$delim"
+        echo "chmod +x /usr/local/bin/$name"
+        echo ""
+      } >> "$extras_concat"
+    done < "$host_scripts_manifest"
   fi
-  echo "mkdir -p /usr/local/bin" >> "$extras_concat"
-  while IFS= read -r host_path || [[ -n "$host_path" ]]; do
-    # skip blank lines and '#' comments
-    [[ -z "$host_path" || "$host_path" =~ ^[[:space:]]*# ]] && continue
-    if [[ ! -f "$host_path" ]]; then
-      echo "host script not found, skipping: $host_path" >&2
-      continue
-    fi
+
+  if [[ -n "$bashrc_local" ]]; then
     extras_any=1
-    name=$(basename "$host_path")
-    echo "embedding host script $name" >&2
-    delim="UTIL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
+    echo "embedding bashrc.local (placed + sourced from ~/.bashrc)" >&2
     {
-      echo "cat <<'$delim' > /usr/local/bin/$name"
-      cat "$host_path"
-      echo "$delim"
-      echo "chmod +x /usr/local/bin/$name"
+      echo "cat <<'BASHRC_LOCAL_EOF' > /home/dev/.bashrc.local"
+      cat "$bashrc_local"
+      echo ""
+      echo "BASHRC_LOCAL_EOF"
+      echo "chown dev:dev /home/dev/.bashrc.local"
+      # idempotent: only add the sourcing line if not already present, since
+      # a rebuild re-runs this against a fresh guest each time anyway, but
+      # this keeps the mechanism correct even if that ever changes
+      echo "grep -qxF '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' /home/dev/.bashrc || echo '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' >> /home/dev/.bashrc"
+      echo "chown dev:dev /home/dev/.bashrc"
       echo ""
     } >> "$extras_concat"
-  done < "$host_scripts_manifest"
-fi
-
-if [[ -n "$bashrc_local" ]]; then
-  if [[ ! -f "$bashrc_local" ]]; then
-    echo "--bashrc-local file not found: $bashrc_local" >&2
-    exit 1
   fi
-  extras_any=1
-  echo "embedding bashrc.local (placed + sourced from ~/.bashrc)" >&2
-  {
-    echo "cat <<'BASHRC_LOCAL_EOF' > /home/dev/.bashrc.local"
-    cat "$bashrc_local"
-    echo "BASHRC_LOCAL_EOF"
-    echo "chown dev:dev /home/dev/.bashrc.local"
-    # idempotent: only add the sourcing line if not already present, since a
-    # rebuild re-runs this against a fresh guest each time anyway, but this
-    # keeps the mechanism correct even if that ever changes
-    echo "grep -qxF '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' /home/dev/.bashrc || echo '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' >> /home/dev/.bashrc"
-    echo "chown dev:dev /home/dev/.bashrc"
-    echo ""
-  } >> "$extras_concat"
-fi
 
-if [[ "$extras_any" -eq 0 ]]; then
-  echo "# no host scripts or bashrc content requested" > "$extras_concat"
-fi
+  if [[ "$extras_any" -eq 0 ]]; then
+    echo "# no host scripts or bashrc content requested" > "$extras_concat"
+  fi
+}
 
-sed -e "/REPLACE-WITH-HOST-EXTRAS-POST/{r $extras_concat" -e 'd}' "$out.tmp1" > "$out"
-rm -f "$out.tmp1"
+#
+# Splices 'tools_concat' and 'extras_concat' into the template's two markers
+# via sed's r+d idiom, writing the result to 'out'. Only the marker lines
+# themselves are touched -- everything else in the template, including the
+# surrounding %post/%end lines, passes through unchanged.
+#
+# Refs script-level vars: 'template', 'tools_concat', 'extras_concat', 'out'
+#
+function render_kickstart() {
+  local tmp1
+  tmp1=$(mktemp)
+  sed -e "/REPLACE-WITH-DEVTOOLS-POST/{r $tools_concat" -e 'd}' "$template" > "$tmp1"
+  sed -e "/REPLACE-WITH-HOST-EXTRAS-POST/{r $extras_concat" -e 'd}' "$tmp1" > "$out"
+  rm -f "$tmp1"
+}
 
-# password hash: escape sed metacharacters, and use '#' as the delimiter since
-# a sha512crypt hash's alphabet (./0-9A-Za-z$) can't collide with it -- '/'
-# would be the wrong choice here for the same reason it was in the very first
-# sed problem this project ran into
-escaped_hash=$(printf '%s' "$password_hash" | sed -e 's/[#&\\]/\\&/g')
-sed -i "s#REPLACE-WITH-DEVPASSWORD-HASH#$escaped_hash#" "$out"
+#
+# Substitutes the real password hash for its marker in 'out', in place.
+#
+# The hash is escaped for sed metacharacters, and '#' is used as the sed
+# delimiter since a sha512crypt hash's alphabet (./0-9A-Za-z$) can't collide
+# with it -- '/' would be the wrong delimiter choice for the same reason it
+# was in the very first sed problem this project ran into.
+#
+# Refs script-level vars: 'password_hash', 'out'
+#
+function apply_password_hash() {
+  local escaped_hash
+  escaped_hash=$(printf '%s' "$password_hash" | sed -e 's/[#&\\]/\\&/g')
+  sed -i "s#REPLACE-WITH-DEVPASSWORD-HASH#$escaped_hash#" "$out"
+}
+
+#
+# Entry point
+#
+parse_args "$@"
+
+init_tempfiles
+
+build_tools_section
+
+build_extras_section
+
+render_kickstart
+
+apply_password_hash
