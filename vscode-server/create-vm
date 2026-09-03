@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Creates a VM pre-configured to run VS Code Remote SSH server using
+# a kickstart configured for that purpose.
+#
+
+set -e
+
+long_opts=vm-name:,linux-iso-path:,os-variant:,ssh-key:,shared-dir:
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+vm_name=
+linux_iso_path=
+os_variant=
+ssh_key=
+shared_dir=
+
+if ! parsed=$($script_dir/../shared/parseargs $long_opts "$@"); then
+  echo "$parsed"
+  exit 1
+fi
+eval $(echo -e "$parsed")
+
+if [[ -z "$shared_dir" ]]; then
+  echo "--shared-dir is required"
+  exit 1
+elif [[ ! -d "$shared_dir" ]]; then
+  echo "shared directory arg does not exist or is not a directory: $shared_dir"
+  exit 1
+fi
+shared_dir_abs="$(cd "$shared_dir" && pwd)"
+
+echo "interpolating SSH key into kickstart file"
+ksout_dir=$HOME/tmp
+mkdir -p $ksout_dir
+ssh_key_var=$(<$ssh_key)
+escaped=$(printf '%s' "$ssh_key_var" | sed -e 's/[\/&\\]/\\&/g')
+sed "s/REPLACE-WITH-SSHKEY/$escaped/" $script_dir/vscode-server.ks.cfg >| $ksout_dir/ks.cfg
+
+# memory is MiB
+# 'sharedfolder' is the virtiofs tag the guest mounts by; kept fixed so the
+# kickstart file doesn't need per-VM interpolation for it.
+echo "creating VM"
+virt-install\
+  --noautoconsole\
+  --name $vm_name\
+  --memory 2000\
+  --vcpus 2\
+  --disk size=30\
+  --location $linux_iso_path\
+  --boot hd,cdrom\
+  --graphics none\
+  --os-variant $os_variant\
+  --initrd-inject $ksout_dir/ks.cfg\
+  --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=$shared_dir_abs,target.dir=sharedfolder\
+  --memorybacking access.mode=shared\
+  --extra-args="inst.ks=file:/ks.cfg console=tty0 console=ttyS0,115200n8"
+
+echo "waiting (indefinitely) for the machine to power off"
+while true; do
+  virsh list --all | grep $vm_name | grep -iv running && break || sleep 10s
+done
+
+echo "template VM fully provisioned"

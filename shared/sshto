@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# Usage: ./sshto vmname username private-key
+#
+
+if [[ "$#" -ne 3 ]]; then
+  echo "Usage: ./sshto vmname username /path/to/private-key
+  exit 1
+fi
+
+function get_ip() {
+  vm=$1
+  while true; do
+    if virsh domifaddr $vm | grep -qE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'; then
+      break
+    fi
+    sleep 1s
+  done
+
+  ip=$(virsh domifaddr $vm | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | awk '{print $4}')
+  echo "${ip%/*}"
+}
+
+ip=$(get_ip $1)
+user=$2
+key=$3
+
+ssh -i $key $user@$ip

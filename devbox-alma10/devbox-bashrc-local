@@ -1,0 +1,9 @@
+# gets written/appended to .bashrc.local in the guest and a line
+# added to .bashrc to source
+
+alias h='source /usr/local/bin/hist'
+
+function k() {
+   kubectl "$@"
+}
+export -f k

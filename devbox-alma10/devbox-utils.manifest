@@ -1,0 +1,6 @@
+# This file contains a list of absolute host path refs to scripts you want
+# copied into /usr/local/bin in the guest.
+
+/home/eace/scripts/hist
+/home/eace/scripts/gl
+/home/eace/scripts/dirsize

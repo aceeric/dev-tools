@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# Renders templated alma-devbox.ks.cfg based on optional args:
+#
+# --tools-dir
+#
+# Iterates tools.d/*.sh in sorted order, and generates install scripts in the
+# guest. Adding a new tool later just means dropping a new numbered .sh file in
+# tools.d/ and rerunning create-vm.
+#
+# --host-scripts-manifest
+#
+# Reads a manifest of host-side script paths and copies each script to the guest
+# at /usr/local/bin to serve as callable utilities after the install completes.
+#
+# --bashrc-local
+#
+# Places the given host file as ~/.bashrc.local in the guest and appends an
+# idempotent sourcing line to ~/.bashrc, since Alma's default .bashrc doesn't
+# source .bashrc.local on its own the way some other distros do.
+#
+set -e
+
+long_opts=template:,tools-dir:,password-hash:,host-scripts-manifest:,bashrc-local:,out:
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+template=
+tools_dir=
+password_hash=
+host_scripts_manifest=
+bashrc_local=
+out=
+
+if ! parsed=$($script_dir/../shared/parseargs $long_opts "$@"); then
+  echo "$parsed"
+  exit 1
+fi
+
+# printf -v avoids eval side-effects (e.g. embedded '$' in arg values)
+
+while IFS='=' read -r name value; do
+  [[ -z "$name" ]] && continue
+  printf -v "$name" '%s' "$value"
+done < <(echo -e "$parsed")
+
+for arg in template password_hash out; do
+  if [[ -z "${!arg}" ]]; then
+    echo "--${arg//_/-} is required"
+    exit 1
+  fi
+done
+
+tools_concat=$(mktemp)
+trap 'rm -f "$tools_concat"' EXIT
+
+found_any=0
+if [[ -n "$tools_dir" ]]; then
+  if [[ ! -d "$tools_dir" ]]; then
+    echo "--tools-dir is not a directory: $tools_dir" >&2
+    exit 1
+  fi
+  echo "mkdir -p /usr/local/sbin/devbox-tools.d" >> "$tools_concat"
+  echo "" >> "$tools_concat"
+
+  while IFS= read -r -d '' script; do
+    found_any=1
+    name=$(basename "$script")
+    echo "embedding $name" >&2
+    # unique per-file delimiter avoids any collision even if a script body
+    # happened to contain a line matching a shared delimiter
+    delim="TOOL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
+    {
+      echo "cat <<'$delim' > /usr/local/sbin/devbox-tools.d/$name"
+      cat "$script"
+      echo "$delim"
+      echo ""
+    } >> "$tools_concat"
+  done < <(find "$tools_dir" -maxdepth 1 -name '*.sh' -print0 | sort -z)
+
+  if [[ "$found_any" -eq 0 ]]; then
+    echo "no scripts found in $tools_dir -- continuing with no dev tools installed" >&2
+  fi
+
+  cat >> "$tools_concat" << 'RUNNER_EOF'
+shopt -s nullglob
+chmod +x /usr/local/sbin/devbox-tools.d/*.sh 2>/dev/null || true
+
+log=/var/log/devbox-tools-install.log
+: > "$log"
+echo "devbox tool install started $(date -Is)" >> "$log"
+failed=0
+for script in /usr/local/sbin/devbox-tools.d/*.sh; do
+  echo "== running $script ==" >> "$log"
+  if ! bash "$script" >> "$log" 2>&1; then
+    echo "== FAILED: $script (see log above; fix in place and re-run: bash $script) ==" >> "$log"
+    failed=1
+  fi
+done
+echo "devbox tool install complete $(date -Is)" >> "$log"
+if [[ "$failed" -eq 1 ]]; then
+  echo "one or more dev tool installs failed -- see $log" >&2
+fi
+RUNNER_EOF
+else
+  echo "# --tools-dir not given; dev tool install skipped" >> "$tools_concat"
+fi
+
+sed -e "/REPLACE-WITH-DEVTOOLS-POST/{r $tools_concat" -e 'd}' "$template" > "$out.tmp1"
+
+# host utility scripts + bashrc (all optional, independent of each other)
+
+extras_concat=$(mktemp)
+trap 'rm -f "$tools_concat" "$extras_concat"' EXIT
+extras_any=0
+
+if [[ -n "$host_scripts_manifest" ]]; then
+  if [[ ! -f "$host_scripts_manifest" ]]; then
+    echo "--host-scripts-manifest file not found: $host_scripts_manifest" >&2
+    exit 1
+  fi
+  echo "mkdir -p /usr/local/bin" >> "$extras_concat"
+  while IFS= read -r host_path || [[ -n "$host_path" ]]; do
+    # skip blank lines and '#' comments
+    [[ -z "$host_path" || "$host_path" =~ ^[[:space:]]*# ]] && continue
+    if [[ ! -f "$host_path" ]]; then
+      echo "host script not found, skipping: $host_path" >&2
+      continue
+    fi
+    extras_any=1
+    name=$(basename "$host_path")
+    echo "embedding host script $name" >&2
+    delim="UTIL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
+    {
+      echo "cat <<'$delim' > /usr/local/bin/$name"
+      cat "$host_path"
+      echo "$delim"
+      echo "chmod +x /usr/local/bin/$name"
+      echo ""
+    } >> "$extras_concat"
+  done < "$host_scripts_manifest"
+fi
+
+if [[ -n "$bashrc_local" ]]; then
+  if [[ ! -f "$bashrc_local" ]]; then
+    echo "--bashrc-local file not found: $bashrc_local" >&2
+    exit 1
+  fi
+  extras_any=1
+  echo "embedding bashrc.local (placed + sourced from ~/.bashrc)" >&2
+  {
+    echo "cat <<'BASHRC_LOCAL_EOF' > /home/dev/.bashrc.local"
+    cat "$bashrc_local"
+    echo "BASHRC_LOCAL_EOF"
+    echo "chown dev:dev /home/dev/.bashrc.local"
+    # idempotent: only add the sourcing line if not already present, since a
+    # rebuild re-runs this against a fresh guest each time anyway, but this
+    # keeps the mechanism correct even if that ever changes
+    echo "grep -qxF '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' /home/dev/.bashrc || echo '[ -f ~/.bashrc.local ] && . ~/.bashrc.local' >> /home/dev/.bashrc"
+    echo "chown dev:dev /home/dev/.bashrc"
+    echo ""
+  } >> "$extras_concat"
+fi
+
+if [[ "$extras_any" -eq 0 ]]; then
+  echo "# no host scripts or bashrc content requested" > "$extras_concat"
+fi
+
+sed -e "/REPLACE-WITH-HOST-EXTRAS-POST/{r $extras_concat" -e 'd}' "$out.tmp1" > "$out"
+rm -f "$out.tmp1"
+
+# password hash: escape sed metacharacters, and use '#' as the delimiter since
+# a sha512crypt hash's alphabet (./0-9A-Za-z$) can't collide with it -- '/'
+# would be the wrong choice here for the same reason it was in the very first
+# sed problem this project ran into
+escaped_hash=$(printf '%s' "$password_hash" | sed -e 's/[#&\\]/\\&/g')
+sed -i "s#REPLACE-WITH-DEVPASSWORD-HASH#$escaped_hash#" "$out"

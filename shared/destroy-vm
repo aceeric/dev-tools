@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# Destroys a devbox VM and cleans up its read-only host bind
+# mount (if a mount exists.)
+#
+set -e
+
+vm_name=$1
+if [[ -z "$vm_name" ]]; then
+  echo "usage: destroy-vm <vm-name>"
+  exit 1
+fi
+
+virsh destroy "$vm_name" 2>/dev/null || true
+virsh undefine "$vm_name" --remove-all-storage
+
+ro_bind_dir="/mnt/devbox-ro/$vm_name"
+if mountpoint -q "$ro_bind_dir" 2>/dev/null; then
+  sudo umount "$ro_bind_dir"
+fi
+sudo rmdir "$ro_bind_dir" 2>/dev/null || true

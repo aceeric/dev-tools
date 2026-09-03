@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+#
+# Creates an ephemeral, graphical AlmaLinux 10 VM for sandboxed development.
+# of potentially dangerous technologies (e.g. Agentic AI.) Guest memory, vcpus
+# and disk are sized for a full desktop plus dev tooling. Adjust as needed.
+#
+# Script runs the mount commands as sudo. Possible password popup depending
+# on how you have sudo configured on the host.
+#
+# DISCLAIMER: THE --os-variant ARG WILL ACCEPT ANYTHING BUT ONLY "almalinux10"
+# HAS BEEN TESTED.
+#
+set -e
+
+#
+# Short and long option definitions
+#
+short_opts=v:,l:,o:,m:,h,d:,t:,s:,b:,n
+long_opts=vm-name:,linux-iso-path:,os-variant:,host-mount-dir:,help,\
+dev-password:,tools-dir:,host-scripts-manifest:,bashrc-local:,no-dnf-update
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_name=$(basename "$0")
+
+# vars initialized by cmdline
+
+#
+# -v|--vm-name
+#
+# Name of the vm to create. Required.
+#
+vm_name=
+
+#
+# -l|--linux-iso-path
+#
+# Path to the linux ISO. Required.
+#
+linux_iso_path=
+
+#
+# -o|--os-variant
+#
+# Must be known to 'virt-install --os-variant list'. Required.
+#
+os_variant=
+
+#
+# -m|--host-mount-dir
+#
+# Path on the house to mount r/o into the guest. Required.
+#
+host_mount_dir=
+
+#
+# -d|--dev-password
+#
+# Password for the dev account in the guest. Required.
+#
+dev_password=
+
+#
+# -t|--tools-dir
+#
+# Path on the host to a directory containing scripts to run. Intended
+# to install dev tools in the guest as a %post step in kickstart. Optional.
+#
+tools_dir=
+
+#
+# -s|--host-scripts-manifest
+#
+# Path on the host to a file containing paths to copy to /usr/local/bin
+# in the guest. Intended to install CLIs and utils in the guest. Optional.
+#
+host_scripts_manifest=
+
+#
+# -b|--bashrc-local
+#
+# Path on the host to a file to copy to /home/dev/.bashrc.local in the
+# guest. Gets wired into ~/.bashrc in the guest. Optional.
+#
+bashrc_local=
+
+#
+# -n|--no-dnf-update
+#
+# Optional. Disables the final dnf update.
+#
+# 1 = Do not do a dnf update after the guest is fully up.
+# 0 = Do a dnf update after the guest is fully up. (The default.)
+#
+no_dnf_update=0
+
+# vars initialized by script
+
+host_mount_dir_abs=
+password_hash=
+ro_bind_dir=
+workdir=
+
+function usage() {
+  awk '{if (NR!=1) print substr($0,5)}' <<< '
+    Creates an ephemeral, graphical AlmaLinux 10 VM for sandboxed development.
+    of potentially dangerous technologies (e.g. Agentic AI.) Guest memory, vcpus
+    and disk are sized for a full desktop plus dev tooling.
+ 
+    Usage: create-vm [-h,--help] [-v,--vm-name name] [-l,--linux-iso-path path]
+           [-o,--os-variant almalinux10] [-m,--host-mount-dir path]
+           [-d,--dev-password pass] [-t,--tools-dir path]
+           [-s,--host-scripts-manifest path] [-b,--bashrc-local path]
+           [-n,--no-dnf-update]
+    
+    Options:
+    
+      -v,--vm-name               The name of the guest vm to create
+      -l,--linux-iso-path        Path to the Alma 10 ISO
+      -o,--os-variant            Recommend "almalinux10"
+      -m,--host-mount-dir        Path to host dir to mount r/o in guest
+      -d,--dev-password          Pass for the "dev" account
+      -t,--tools-dir             Path to "tools.d"
+      -s,--host-scripts-manifest Path to file containing scripts to copy to guest
+      -b,--bashrc-local          Path to file with content to place in .bashrc.local
+                                 in the guest.
+      -n,--no-dnf-update         If specified, skips final DNF update
+      -h,--help                  Prints this help and exits
+
+    Positional params:
+
+      None.
+
+    Examples:
+
+      ./create-vm\
+        --vm-name alma10-dev\
+        --linux-iso-path ./AlmaLinux-10.2-x86_64_v2-dvd.iso\
+        --os-variant almalinux10\
+        --host-mount-dir $PWD\
+        --dev-password frobozz\
+        --host-scripts-manifest ./devbox-utils.manifest\
+        --bashrc-local ./devbox-bashrc-local\
+        --tools-dir ./tools.d
+    '
+}
+
+#
+# Helps interpret values parsed by getopt
+#
+# Params:
+#
+#   $1 is an option parameter parsed by getopt
+#
+# Returns:
+#
+#   If $1 starts with the equals sign, then returns everything after the equals
+#   sign. Otherwise returns $1 unmodified. Because if the user specifies a short
+#   option with the equal sign, (e.g. '-l=100') getopt includes the equal in the
+#   parsed option value. Technically the user shouldn't do that, but if they do
+#   we want to handle that. If the user specifies an option in any of the
+#   following forms, the parsed value will be correct:
+#     -l100
+#     -l 100
+#     -l=100
+#     --level=100
+#     --level 100
+#   (By the way, 'getopt' will parse -l100 and pick out the value 100, but will
+#   not parse --level100)
+#
+function opt_val() {
+  opt="$1"
+  if [[ "$opt" == =* ]]; then
+    echo "${opt:1}"
+  else
+    echo "$opt"
+  fi
+}
+
+#
+# Parses the command line and sets script variables
+#
+# Params:
+#
+#   $@ - The entire command line
+#
+# Returns:
+#
+#   Nothing
+#
+# Exits:
+#
+#   If parse error
+#
+# Sets script variables:
+#
+#   vm_name                -- from '-v|--vm-name'
+#   linux_iso_path         -- from '-l|--linux-iso-path'
+#   os_variant             -- from '-o|--os-variant'
+#   host_mount_dir         -- from '-m|--host-mount-dir'
+#   dev_password           -- from '-d|--dev-password'
+#   tools_dir              -- from '-t|--tools-dir'
+#   host_scripts_manifest  -- from '-s|--host-scripts-manifest'
+#   bashrc_local           -- from '-b|--bashrc-local'
+#   no_dnf_update          -- from '-n|--no-dnf-update'
+#
+
+function parse_args() {
+  # must separate the local declaration from the assignment or the exit code is lost
+  local parsed
+  parsed=$(getopt --options $short_opts --longoptions $long_opts -n $script_name -- "$@")
+
+  if [[ "$?" -ne 0 ]]; then
+    exit 1
+  fi
+
+  eval set -- "$parsed"
+
+  while true; do
+    case "$1" in
+      -v|--vm-name)
+        vm_name=$(opt_val "$2")
+        shift 2
+        ;;
+      -l|--linux-iso-path)
+        linux_iso_path=$(opt_val "$2")
+        shift 2
+        ;;
+      -o|--os-variant)
+        os_variant=$(opt_val "$2")
+        shift 2
+        ;;
+      -m|--host-mount-dir)
+        host_mount_dir=$(opt_val "$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 1
+        ;;
+      -d|--dev-password)
+        dev_password=$(opt_val "$2")
+        shift 2
+        ;;
+      -t|--tools-dir)
+        tools_dir=$(opt_val "$2")
+        shift 2
+        ;;
+      -s|--host-scripts-manifest)
+        host_scripts_manifest=$(opt_val "$2")
+        shift 2
+        ;;
+      -b|--bashrc-local)
+        bashrc_local=$(opt_val "$2")
+        shift 2
+        ;;
+      -n|--no-dnf-update)
+        no_dnf_update=1
+        shift 1
+        ;;
+      --)
+        shift
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -ne 0 ]]; then
+    echo "$script_name: Positional param(s) not supported"
+    exit 1
+  fi
+
+  for arg in vm_name linux_iso_path os_variant host_mount_dir dev_password; do
+    if [[ -z "${!arg}" ]]; then
+      echo "--${arg//_/-} is required"
+      exit 1
+    fi
+  done
+
+  for dir in host_mount_dir tools_dir; do
+    if [[ -n "${!dir}" ]]; then
+      if [[ ! -d "${!dir}" ]]; then
+        echo "directory does not exist or is not a directory: ${!dir}"
+        exit 1
+      fi
+    fi
+  done
+
+  for file in linux_iso_path host_scripts_manifest bashrc_local; do
+    if [[ -n "${!file}" ]]; then
+      if [[ ! -f "${!file}" ]]; then
+        echo "file does not exist or is not a file: ${!file}"
+        exit 1
+      fi
+    fi
+  done
+}
+
+#
+# Open Tofu installer 'tools.d/03-opentofu.sh' has an explicit -tags http2legacy
+# workaround for a known Go 1.27 + x/net v0.54.0 incompatibility. If the Go release
+# available today has moved on, that workaround may no longer be needed, or may no
+# longer be sufficient for whatever new issue replaced it -- flag it rather than
+# silently build against an assumption that might be stale.
+#
+function check_go_version() {
+  expected_go_version=go1.27.1
+  current_go_version=$(curl -fsSL "https://go.dev/VERSION?m=text" 2>/dev/null | head -n1)
+  if [[ -n "$current_go_version" && "$current_go_version" != "$expected_go_version" ]]; then
+    echo
+    echo "IMPORTANT: tools.d/03-opentofu.sh build instructions have an explicit"
+    echo "override for Golang 1.27.1 -- current Go release has changed"
+    echo "(now $current_go_version) -- recommend to re-assess opentofu build."
+    echo
+    read -p "Press ENTER to continue, or Ctrl-C to abort: "
+  elif [[ -z "$current_go_version" ]]; then
+    echo "warning: couldn't reach go.dev to check current Go version -- skipping check"
+  fi
+}
+
+#
+# The VM build specifies graphics: virtio-gpu + SPICE OpenGL/VirGL passthrough.
+# AlmaLinux re-enabled SPICE support (reversing RHEL 10's removal) but GNOME
+# on RHEL10-family is Wayland-only, and QXL's dynamic-resize mechanism relies
+# on X11. This requires a real GPU render node on the HOST. If the path checked
+# for in the function doesn't exist or isn't VirGL-capable, the VM will fail
+# to start.
+#
+function check_render_node_device {
+  if [[ ! -e /dev/dri/renderD128 ]]; then
+    echo "warning: /dev/dri/renderD128 not found on this host -- SPICE GL"
+    echo "passthrough (virtio-gpu,accel3d=yes) will likely fail to start."
+    echo "check 'ls /dev/dri/' for the actual render node on this machine."
+  fi
+}
+
+#
+# The VM will mount a host directory in the guest. Enforce read-only at
+# the host kernel level via a read-only bind mount because virtiofs itself
+# has no host-enforced read-only flag: a guest fstab 'ro' entry can be
+# remounted rw by guest root. Since this VM is meant to sandbox potentially
+# dangerous processes, the restriction needs to live below the guest's own
+# control, so we bind-mount read-only on the host and export the bind mount.
+#
+# 'ro_bind_dir' and 'host_mount_dir_abs' are a script-level vars.
+#
+function create_host_bind_mount {
+  ro_bind_dir="/mnt/devbox-ro/$vm_name"
+  host_mount_dir_abs="$(cd "$host_mount_dir" && pwd)"
+  sudo mkdir -p "$ro_bind_dir"
+  if ! mountpoint -q "$ro_bind_dir"; then
+    sudo mount --bind "$host_mount_dir_abs" "$ro_bind_dir"
+    sudo mount -o remount,ro,bind "$ro_bind_dir"
+  fi
+  echo "host directory $host_mount_dir_abs is read-only bind-mounted at $ro_bind_dir"
+}
+
+#
+# Kickstart is delivered via --initrd-inject + inst.ks=file:/ks.cfg when the
+# guest is created. The logic to build the kickstart is complicated enough to
+# modularize in its own script: it passes tool installers, scripts, and .basrc
+# customizations into the guest through kickstart %post sections.
+#
+# 'password_hash' is a script-level variable.
+#
+function build_kickstart() {
+  echo "building kickstart"
+  password_hash=$(openssl passwd -6 "$dev_password")
+  $script_dir/build-kickstart\
+    --template $script_dir/alma-devbox.ks.cfg\
+    --password-hash $password_hash\
+    --tools-dir=$tools_dir\
+    --host-scripts-manifest=$host_scripts_manifest\
+    --bashrc-local=$bashrc_local\
+    --out $work_dir/ks.cfg
+}
+
+#
+# Creates the guest VM.
+#
+# We specify 120 gig disk because we git clone the various tools to avoid
+# rate limiting when curling down releases. Only one console in extra args
+# means you can't access the guest using virsh console during guest creation.
+# (But you can afterwards.)
+#
+# Refs script level vars: 'linux_iso_path', 'os_variant', 'work_dir',
+# and 'ro_bind_dir'
+#
+function create_guest() {
+  echo "creating guest (this runs the full AlmaLinux install; it can take a while)"
+  virt-install\
+    --noautoconsole\
+    --wait -1\
+    --name $vm_name\
+    --memory 8192\
+    --vcpus 4\
+    --disk size=120\
+    --location $linux_iso_path\
+    --boot hd,cdrom\
+    --os-variant $os_variant\
+    --initrd-inject "$work_dir/ks.cfg"\
+    --extra-args="inst.ks=file:/ks.cfg console=tty0"\
+    --graphics spice,listen=none,gl.enable=yes,gl.rendernode=/dev/dri/renderD128\
+    --video virtio,accel3d=yes,heads=2\
+    --channel spicevmc,target_type=virtio,name=com.redhat.spice.0\
+    --channel unix,target_type=virtio,name=org.qemu.guest_agent.0\
+    --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=$ro_bind_dir,target.dir=hostshare\
+    --memorybacking access.mode=shared
+}
+
+#
+# Waits one minute  for 'vm_name' to obtain an IP address. Result is returned
+# as a function output.
+#
+# Refs script level var: 'vm_name'
+#
+function wait_for_guest_ip() {
+  echo "waiting for a DHCP lease to report the post-cycle IP" >&2
+  guest_ip=
+  for i in $(seq 1 30); do
+    guest_ip=$(virsh domifaddr $vm_name 2>/dev/null | awk '/ipv4/ {print $4}' | cut -d/ -f1 | head -n1)
+    [[ -n "$guest_ip" ]] && break
+    sleep 2
+  done
+  echo $guest_ip
+}
+
+#
+# Temp dir cleanup function. Guards against accidentally deleting
+# everything if work_dir is empty or unbound.
+#
+# Refs script level var: 'work_dir'
+#
+function cleanup_workdir() {
+  if [[ -n "${work_dir:-}" ]]; then
+    rm -rf "$work_dir"
+  fi
+}
+
+#
+# Initializes the 'work_dir' script-level variable as a temp
+# directory.
+#
+function init_workdir() {
+  work_dir=$(mktemp -d)
+  trap cleanup_workdir EXIT
+}
+
+#
+# If dnf update is enabled (the default unless disabled by --no-dnf-update)
+# then attempts to run a dnf update in the guest. Requires the sshpass CLI
+# and the script will warn and skip this step if sshpass is not available.
+#
+# Refs script vars 'no_dnf_update', 'guest_ip', 'dev_password'
+#
+function dnf_update() {
+  if [[ -n "$no_dnf_update" ]]; then
+    echo "skipping one-time package update (--no-dnf-update)"
+  elif [[ -z "$guest_ip" ]]; then
+    echo "warning: no IP found -- skipping the one-time package update"
+  elif ! command -v sshpass >/dev/null 2>&1; then
+    echo "warning: sshpass not found on this host -- skipping the one-time"
+    echo "package update. Install it (e.g. 'sudo apt install sshpass') to"
+    echo "enable this step."
+  else
+    echo "waiting for sshd to accept connections"
+    ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
+    ssh_ready=0
+    for i in $(seq 1 30); do
+      if sshpass -p "$dev_password" ssh "${ssh_opts[@]}" "dev@$guest_ip" true 2>/dev/null; then
+        ssh_ready=1
+        break
+      fi
+      sleep 5
+    done
+
+    if [[ "$ssh_ready" -eq 0 ]]; then
+      echo "warning: sshd did not become reachable -- skipping the one-time"
+      echo "package update"
+    else
+      echo "running one-time package update over SSH before first login (so"
+      echo "the graphics stack never updates out from under an active session)"
+      sshpass -p "$dev_password" ssh "${ssh_opts[@]}" "dev@$guest_ip" \
+        "sudo dnf -y update && sudo dnf clean all" || \
+        echo "warning: package update failed or was incomplete -- continuing anyway"
+    fi
+  fi
+}
+
+#
+# Hard-restarts the guest.
+#
+# The first boot's SPICE GL session is laggy/loses the cursor, and a power-cycle
+# clears it up. It's a *hard* cycle specifically because virtiofs is documented
+# to hang a guest's graceful shutdown/reboot -- a host-side destroy+start sidesteps
+# that class of bug entirely rather than waiting on a guest teardown that may
+# never finish.
+#
+# Refs script level var 'vm_name'
+#
+function cycle_guest {
+  echo
+  echo "waiting for the guest agent to respond before power-cycling (this also"
+  echo "confirms the system has settled past first-boot housekeeping, not"
+  echo "mid-write on anything)"
+
+  agent_ready=0
+  for i in $(seq 1 60); do
+    if virsh qemu-agent-command $vm_name '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+      agent_ready=1
+      break
+    fi
+    sleep 5
+  done
+  if [[ "$agent_ready" -eq 0 ]]; then
+    echo "warning: guest agent did not respond after 5 minutes -- proceeding"
+    echo "with the power-cycle anyway, but this is less safe than usual"
+  fi
+
+  echo "cycling the VM once (virsh destroy + start) to clear up first-boot"
+  echo "SPICE GL lag/cursor glitches, and to boot into any just-installed"
+  echo "kernel/graphics-stack updates cleanly -- NOT a graceful in-guest"
+  echo "reboot, since virtiofs is known to hang graceful guest shutdowns; a"
+  echo "hard power-cycle from the host side avoids that entirely"
+
+  virsh destroy $vm_name
+  sleep 2
+  virsh start $vm_name
+}
+
+#
+# Summarizes results for the operator.
+#
+# Refs script level vars 'vm_name', 'guest_ip', 'host_scripts_manifest',
+# and 'bashrc_local'
+#
+function show_done() {
+  echo
+  echo "Dev box '$vm_name' is installed and running. Connect with:"
+  echo "  virt-viewer --full-screen --attach $vm_name"
+  echo
+  echo "Guest is built with graphics listen=none + SPICE GL so --attach is"
+  echo "required. Plain virt-viewer or remote-viewer + domdisplay will not"
+  echo "work with this graphics config)"
+  echo 
+  echo "Host directory $host_mount_dir is mounted READ-ONLY in the guest at"
+  echo "/mnt/hostshare"
+
+  if [[ -n "$guest_ip" ]]; then
+    echo "ssh for pulling files out (SPICE has no guest->host file transfer):"
+    echo "  ssh dev@$guest_ip"
+  else
+    echo "ssh: no IP found yet -- check later with: virsh domifaddr $vm_name"
+  fi
+
+  if [[ -n "$tools_dir" ]]; then
+    echo "Dev tools were installed during setup. Kickstart log in the guest"
+    echo "at: /root/devbox-tools-kickstart.log"
+  fi
+
+  if [[ -n "$host_scripts_manifest" || -n "$bashrc_local" ]]; then
+    echo "host scripts and/or bashrc extras applied. Kickstart log in the guest"
+    echo "at: /root/devbox-host-extras-kickstart.log"
+  fi
+
+  echo
+  echo "if dynamic resize/clipboard aren't reliable via SPICE, the documented"
+  echo "fallback is GNOME's built-in Wayland-native Remote Desktop (RDP)"
+  echo "instead of a SPICE viewer -- see project notes."
+}
+
+#
+# Entry point
+#
+parse_args "$@"
+
+echo "Running with settings:"
+echo
+echo "vm_name               = $vm_name"
+echo "linux_iso_path        = $linux_iso_path"
+echo "os_variant            = $os_variant"
+echo "host_mount_dir        = $host_mount_dir"
+echo "dev_password          = $dev_password"
+echo "tools_dir             = $tools_dir"
+echo "host_scripts_manifest = $host_scripts_manifest"
+echo "bashrc_local          = $bashrc_local"
+echo "no_dnf_update         = $no_dnf_update"
+
+# operator can terminate here
+check_go_version
+
+# warning only but missing device could fail the install
+check_render_node_device
+
+create_host_bind_mount
+
+init_workdir
+
+build_kickstart
+
+create_guest
+
+guest_ip=$(wait_for_guest_ip)
+
+dnf_update
+
+cycle_guest
+
+guest_ip=$(wait_for_guest_ip)
+
+show_done
