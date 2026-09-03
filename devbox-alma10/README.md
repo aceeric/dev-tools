@@ -21,9 +21,10 @@ This assumes you downloaded Alma to _this_ directory. The user account created i
 in this case `tools.d` in this repo.
 
 ```
+ALMAPATH=/path/to/AlmaLinux-10.2-x86_64_v2-dvd.iso
 ./create-vm\
   --vm-name alma10-dev\
-  --linux-iso-path ./AlmaLinux-10.2-x86_64_v2-dvd.iso\
+  --linux-iso-path $ALMAPATH\
   --os-variant almalinux10\
   --host-mount-dir $PWD\
   --dev-password frobozz\

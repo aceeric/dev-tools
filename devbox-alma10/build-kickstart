@@ -67,11 +67,14 @@ if [[ -n "$tools_dir" ]]; then
     name=$(basename "$script")
     echo "embedding $name" >&2
     # unique per-file delimiter avoids any collision even if a script body
-    # happened to contain a line matching a shared delimiter
+    # happened to contain a line matching a shared delimiter. Ensure file
+    # has a trailing newline otherwise the terminating heredoc delimiter
+    # will be on the same line as the last content line.
     delim="TOOL_$(printf '%s' "$name" | tr 'a-z.-' 'A-Z__')_EOF"
     {
       echo "cat <<'$delim' > /usr/local/sbin/devbox-tools.d/$name"
       cat "$script"
+      echo ""
       echo "$delim"
       echo ""
     } >> "$tools_concat"
