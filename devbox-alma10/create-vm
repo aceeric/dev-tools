@@ -99,6 +99,7 @@ host_mount_dir_abs=
 password_hash=
 ro_bind_dir=
 workdir=
+guest_ip=
 
 function usage() {
   awk '{if (NR!=1) print substr($0,5)}' <<< '
@@ -293,6 +294,18 @@ function parse_args() {
       fi
     fi
   done
+
+  echo "$script_name running with settings:"
+  echo
+  echo "vm_name               = $vm_name"
+  echo "linux_iso_path        = $linux_iso_path"
+  echo "os_variant            = $os_variant"
+  echo "host_mount_dir        = $host_mount_dir"
+  echo "dev_password          = $dev_password"
+  echo "tools_dir             = $tools_dir"
+  echo "host_scripts_manifest = $host_scripts_manifest"
+  echo "bashrc_local          = $bashrc_local"
+  echo "no_dnf_update         = $no_dnf_update"
 }
 
 #
@@ -301,6 +314,8 @@ function parse_args() {
 # available today has moved on, that workaround may no longer be needed, or may no
 # longer be sufficient for whatever new issue replaced it -- flag it rather than
 # silently build against an assumption that might be stale.
+#
+# The operator can terminate the script here.
 #
 function check_go_version() {
   expected_go_version=go1.27.1
@@ -324,6 +339,9 @@ function check_go_version() {
 # on X11. This requires a real GPU render node on the HOST. If the path checked
 # for in the function doesn't exist or isn't VirGL-capable, the VM will fail
 # to start.
+#
+# A warning about the missing device may be issued but the missing device could
+# fail the install.
 #
 function check_render_node_device {
   if [[ ! -e /dev/dri/renderD128 ]]; then
@@ -408,8 +426,8 @@ function create_guest() {
 }
 
 #
-# Waits one minute  for 'vm_name' to obtain an IP address. Result is returned
-# as a function output.
+# Waits one minute  for 'vm_name' to obtain an IP address. Result is set into
+# script-level var 'guest_ip'.
 #
 # Refs script level var: 'vm_name'
 #
@@ -421,7 +439,6 @@ function wait_for_guest_ip() {
     [[ -n "$guest_ip" ]] && break
     sleep 2
   done
-  echo $guest_ip
 }
 
 #
@@ -573,22 +590,8 @@ function show_done() {
 #
 parse_args "$@"
 
-echo "Running with settings:"
-echo
-echo "vm_name               = $vm_name"
-echo "linux_iso_path        = $linux_iso_path"
-echo "os_variant            = $os_variant"
-echo "host_mount_dir        = $host_mount_dir"
-echo "dev_password          = $dev_password"
-echo "tools_dir             = $tools_dir"
-echo "host_scripts_manifest = $host_scripts_manifest"
-echo "bashrc_local          = $bashrc_local"
-echo "no_dnf_update         = $no_dnf_update"
-
-# operator can terminate here
 check_go_version
 
-# warning only but missing device could fail the install
 check_render_node_device
 
 create_host_bind_mount
@@ -599,12 +602,12 @@ build_kickstart
 
 create_guest
 
-guest_ip=$(wait_for_guest_ip)
+wait_for_guest_ip
 
 dnf_update
 
 cycle_guest
 
-guest_ip=$(wait_for_guest_ip)
+wait_for_guest_ip
 
 show_done

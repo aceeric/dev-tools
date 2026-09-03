@@ -1,64 +1,339 @@
 #!/usr/bin/env bash
 #
-# Creates a VM pre-configured to run VS Code Remote SSH server using
-# a kickstart configured for that purpose.
+# Creates a template VM pre-configured to run VS Code's Remote-SSH server,
+# via a kickstart built for that purpose. The VM shuts itself down at the
+# end of kickstart (it's a template meant to be cloned, not used directly);
+# this script waits for that shutdown before returning.
 #
-
 set -e
 
-long_opts=vm-name:,linux-iso-path:,os-variant:,ssh-key:,shared-dir:
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# Short and long option definitions
+#
+short_opts=v:,l:,o:,k:,s:,h
+long_opts=vm-name:,linux-iso-path:,os-variant:,ssh-key:,shared-dir:,help
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_name=$(basename "$0")
+
+# vars initialized by cmdline
+
+#
+# -v|--vm-name
+#
+# Name of the vm to create. Required.
+#
 vm_name=
+
+#
+# -l|--linux-iso-path
+#
+# Path to the linux ISO. Required.
+#
 linux_iso_path=
+
+#
+# -o|--os-variant
+#
+# Must be known to 'virt-install --os-variant list'. Required.
+#
 os_variant=
+
+#
+# -k|--ssh-key
+#
+# Path to the public SSH key to authorize for SSH access in the guest.
+# Required.
+#
 ssh_key=
+
+#
+# -s|--shared-dir
+#
+# Path on the host to share read-write into the guest via virtiofs (tag
+# 'sharedfolder'). Required.
+#
 shared_dir=
 
-if ! parsed=$($script_dir/../shared/parseargs $long_opts "$@"); then
-  echo "$parsed"
-  exit 1
-fi
-eval $(echo -e "$parsed")
+# vars initialized by script
 
-if [[ -z "$shared_dir" ]]; then
-  echo "--shared-dir is required"
-  exit 1
-elif [[ ! -d "$shared_dir" ]]; then
-  echo "shared directory arg does not exist or is not a directory: $shared_dir"
-  exit 1
-fi
-shared_dir_abs="$(cd "$shared_dir" && pwd)"
+shared_dir_abs=
+work_dir=
 
-echo "interpolating SSH key into kickstart file"
-ksout_dir=$HOME/tmp
-mkdir -p $ksout_dir
-ssh_key_var=$(<$ssh_key)
-escaped=$(printf '%s' "$ssh_key_var" | sed -e 's/[\/&\\]/\\&/g')
-sed "s/REPLACE-WITH-SSHKEY/$escaped/" $script_dir/vscode-server.ks.cfg >| $ksout_dir/ks.cfg
+function usage() {
+  awk '{if (NR!=1) print substr($0,5)}' <<< '
+    Creates a template VM pre-configured to run VS Code Remote-SSH server,
+    via a kickstart built for that purpose.
 
-# memory is MiB
-# 'sharedfolder' is the virtiofs tag the guest mounts by; kept fixed so the
-# kickstart file doesn't need per-VM interpolation for it.
-echo "creating VM"
-virt-install\
-  --noautoconsole\
-  --name $vm_name\
-  --memory 2000\
-  --vcpus 2\
-  --disk size=30\
-  --location $linux_iso_path\
-  --boot hd,cdrom\
-  --graphics none\
-  --os-variant $os_variant\
-  --initrd-inject $ksout_dir/ks.cfg\
-  --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=$shared_dir_abs,target.dir=sharedfolder\
-  --memorybacking access.mode=shared\
-  --extra-args="inst.ks=file:/ks.cfg console=tty0 console=ttyS0,115200n8"
+    Usage: create-vm [-h,--help] [-v,--vm-name name] [-l,--linux-iso-path path]
+           [-o,--os-variant variant] [-k,--ssh-key path] [-s,--shared-dir path]
 
-echo "waiting (indefinitely) for the machine to power off"
-while true; do
-  virsh list --all | grep $vm_name | grep -iv running && break || sleep 10s
-done
+    Options:
 
-echo "template VM fully provisioned"
+      -v,--vm-name          The name of the guest vm to create
+      -l,--linux-iso-path   Path to the install ISO
+      -o,--os-variant       Must be known to "virt-install --os-variant list"
+      -k,--ssh-key          Path to a public key authorized in the guest
+      -s,--shared-dir       Path on host shared read-write into the guest
+      -h,--help             Prints this help and exits
+
+    Positional params:
+
+      None.
+
+    Examples:
+
+      ./create-vm\
+        --vm-name myvscode-server\
+        --linux-iso-path ./AlmaLinux-10.2-x86_64_v2-dvd.iso\
+        --os-variant almalinux10\
+        --ssh-key ~/.ssh/id_ed25519.pub\
+        --shared-dir ~/projects
+    '
+}
+
+#
+# Helps interpret values parsed by getopt
+#
+# Params:
+#
+#   $1 is an option parameter parsed by getopt
+#
+# Returns:
+#
+#   If $1 starts with the equals sign, then returns everything after the equals
+#   sign. Otherwise returns $1 unmodified. Because if the user specifies a short
+#   option with the equal sign, (e.g. '-l=100') getopt includes the equal in the
+#   parsed option value. Technically the user shouldn't do that, but if they do
+#   we want to handle that. If the user specifies an option in any of the
+#   following forms, the parsed value will be correct:
+#     -l100
+#     -l 100
+#     -l=100
+#     --level=100
+#     --level 100
+#   (By the way, 'getopt' will parse -l100 and pick out the value 100, but will
+#   not parse --level100)
+#
+function opt_val() {
+  opt="$1"
+  if [[ "$opt" == =* ]]; then
+    echo "${opt:1}"
+  else
+    echo "$opt"
+  fi
+}
+
+#
+# Parses the command line, sets script variables, and validates them.
+#
+# Params:
+#
+#   $@ - The entire command line
+#
+# Returns:
+#
+#   Nothing
+#
+# Exits:
+#
+#   If parse error, or if required args are missing, or if a given path
+#   doesn't exist
+#
+# Sets script variables:
+#
+#   vm_name         -- from '-v|--vm-name'
+#   linux_iso_path  -- from '-l|--linux-iso-path'
+#   os_variant      -- from '-o|--os-variant'
+#   ssh_key         -- from '-k|--ssh-key'
+#   shared_dir      -- from '-s|--shared-dir'
+#
+function parse_args() {
+  # must separate the local declaration from the assignment or the exit code is lost
+  local parsed
+  parsed=$(getopt --options $short_opts --longoptions $long_opts -n $script_name -- "$@")
+
+  if [[ "$?" -ne 0 ]]; then
+    exit 1
+  fi
+
+  eval set -- "$parsed"
+
+  while true; do
+    case "$1" in
+      -v|--vm-name)
+        vm_name=$(opt_val "$2")
+        shift 2
+        ;;
+      -l|--linux-iso-path)
+        linux_iso_path=$(opt_val "$2")
+        shift 2
+        ;;
+      -o|--os-variant)
+        os_variant=$(opt_val "$2")
+        shift 2
+        ;;
+      -k|--ssh-key)
+        ssh_key=$(opt_val "$2")
+        shift 2
+        ;;
+      -s|--shared-dir)
+        shared_dir=$(opt_val "$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 1
+        ;;
+      --)
+        shift
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -ne 0 ]]; then
+    echo "$script_name: Positional param(s) not supported"
+    exit 1
+  fi
+
+  for arg in vm_name linux_iso_path os_variant ssh_key shared_dir; do
+    if [[ -z "${!arg}" ]]; then
+      echo "--${arg//_/-} is required"
+      exit 1
+    fi
+  done
+
+  for dir in shared_dir; do
+    if [[ ! -d "${!dir}" ]]; then
+      echo "directory does not exist or is not a directory: ${!dir}"
+      exit 1
+    fi
+  done
+
+  for file in linux_iso_path ssh_key; do
+    if [[ ! -f "${!file}" ]]; then
+      echo "file does not exist or is not a file: ${!file}"
+      exit 1
+    fi
+  done
+
+  echo "$script_name running with settings:"
+  echo
+  echo "vm_name        = $vm_name"
+  echo "linux_iso_path = $linux_iso_path"
+  echo "os_variant     = $os_variant"
+  echo "ssh_key        = $ssh_key"
+  echo "shared_dir     = $shared_dir"
+}
+
+#
+# Initializes the 'work_dir' script-level variable as a temp directory, and
+# arranges for its cleanup on exit.
+#
+# Sets script-level var: 'work_dir'
+#
+function init_workdir() {
+  work_dir=$(mktemp -d)
+  trap cleanup_workdir EXIT
+}
+
+#
+# Temp dir cleanup function. Guards against accidentally deleting
+# everything if work_dir is empty or unbound.
+#
+# Refs script-level var: 'work_dir'
+#
+function cleanup_workdir() {
+  if [[ -n "${work_dir:-}" ]]; then
+    rm -rf "$work_dir"
+  fi
+}
+
+#
+# Resolves 'shared_dir' to an absolute path for virt-install's --filesystem
+# source.dir, since a relative path wouldn't survive being passed through.
+#
+# Sets script-level var: 'shared_dir_abs'
+#
+function resolve_shared_dir() {
+  shared_dir_abs="$(cd "$shared_dir" && pwd)"
+}
+
+#
+# Interpolates the SSH public key into vscode-server.ks.cfg's
+# REPLACE-WITH-SSHKEY marker, writing the result into 'work_dir'.
+#
+# Refs script-level vars: 'ssh_key', 'script_dir', 'work_dir'
+#
+function build_kickstart() {
+  echo "interpolating SSH key into kickstart file"
+  local ssh_key_var escaped
+  ssh_key_var=$(<"$ssh_key")
+  escaped=$(printf '%s' "$ssh_key_var" | sed -e 's/[\/&\\]/\\&/g')
+  sed "s/REPLACE-WITH-SSHKEY/$escaped/" "$script_dir/vscode-server.ks.cfg" >| "$work_dir/ks.cfg"
+}
+
+#
+# Creates the guest VM. Memory is MiB. 'sharedfolder' is the virtiofs tag
+# the guest mounts by; kept fixed so the kickstart file doesn't need
+# per-VM interpolation for it.
+#
+# Refs script-level vars: 'vm_name', 'linux_iso_path', 'os_variant',
+# 'work_dir', 'shared_dir_abs'
+#
+function create_guest() {
+  echo "creating VM"
+  virt-install\
+    --noautoconsole\
+    --name $vm_name\
+    --memory 2000\
+    --vcpus 2\
+    --disk size=30\
+    --location $linux_iso_path\
+    --boot hd,cdrom\
+    --graphics none\
+    --os-variant $os_variant\
+    --initrd-inject $work_dir/ks.cfg\
+    --filesystem type=mount,accessmode=passthrough,driver.type=virtiofs,source.dir=$shared_dir_abs,target.dir=sharedfolder\
+    --memorybacking access.mode=shared\
+    --extra-args="inst.ks=file:/ks.cfg console=tty0 console=ttyS0,115200n8"
+}
+
+#
+# Blocks until the guest powers itself off at the end of kickstart -- this
+# is a template VM meant to be cloned, not used directly, so kickstart ends
+# in 'shutdown' rather than leaving it running.
+#
+# Refs script-level var: 'vm_name'
+#
+function wait_for_shutdown() {
+  echo "waiting (indefinitely) for the machine to power off"
+  while true; do
+    virsh list --all | grep $vm_name | grep -iv running && break || sleep 10s
+  done
+}
+
+#
+# Summarizes results for the operator.
+#
+function show_done() {
+  echo "template VM fully provisioned"
+}
+
+#
+# Entry point
+#
+parse_args "$@"
+
+init_workdir
+
+resolve_shared_dir
+
+build_kickstart
+
+create_guest
+
+wait_for_shutdown
+
+show_done

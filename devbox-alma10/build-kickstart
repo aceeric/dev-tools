@@ -163,11 +163,11 @@ function opt_val() {
 # Sets script variables:
 #
 #   template               -- from '-t|--template'
-#   tools_dir               -- from '-d|--tools-dir'
-#   password_hash           -- from '-p|--password-hash'
-#   host_scripts_manifest    -- from '-s|--host-scripts-manifest'
-#   bashrc_local             -- from '-b|--bashrc-local'
-#   out                      -- from '-o|--out'
+#   tools_dir              -- from '-d|--tools-dir'
+#   password_hash          -- from '-p|--password-hash'
+#   host_scripts_manifest  -- from '-s|--host-scripts-manifest'
+#   bashrc_local           -- from '-b|--bashrc-local'
+#   out                    -- from '-o|--out'
 #
 function parse_args() {
   # must separate the local declaration from the assignment or the exit code is lost
@@ -246,6 +246,15 @@ function parse_args() {
       fi
     fi
   done
+
+  echo "$script_name running with settings:"
+  echo
+  echo "template               = $template"
+  echo "tools_dir              = $tools_dir"
+  echo "password_hash          = $password_hash"
+  echo "host_scripts_manifest  = $host_scripts_manifest"
+  echo "bashrc_local           = $bashrc_local"
+  echo "out                    = $out"
 }
 
 #
